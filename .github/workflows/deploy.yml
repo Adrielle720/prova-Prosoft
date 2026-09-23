@@ -1,8 +1,6 @@
 name: CI/CD
 
-# PARTE 1 - Trigger
-# Roda em push na main E em pull requests (para o requisito de
-# "pipeline de testes disparado por PR").
+# Roda em push na main E em pull requests para a main.
 on:
   push:
     branches: ["main"]
@@ -12,16 +10,22 @@ on:
 # O projeto Maven fica em uma subpasta do repositorio.
 env:
   PROJECT_DIR: prova-template/prova-template
+  IMAGE_NAME: prova-api
 
 jobs:
 
   # ---------------------------------------------------------------
-  # JOB 1: sempre roda (push OU pull_request) - só compila e testa.
+  # JOB 1: testes (push OU pull_request).
+  # `mvn verify` roda unitarios + integracao (H2) e o jacoco:check,
+  # que falha o build se o ProdutoService nao tiver 100% de cobertura.
   # ---------------------------------------------------------------
   test:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: ${{ env.PROJECT_DIR }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,16 +35,20 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
+          cache: maven
 
-      - name: Run tests with Maven
-        run: mvn -B verify --file ${{ env.PROJECT_DIR }}/pom.xml
-        # verify = testes + jacoco:check (100% no ProdutoService).
-        # Os testes usam H2 (ver src/test/resources/application.properties),
-        # entao NAO precisam de Postgres rodando aqui no Actions.
+      - name: Testes + cobertura
+        run: mvn -B verify
+
+      - name: Publicar relatorio de cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: ${{ env.PROJECT_DIR }}/target/site/jacoco
 
   # ---------------------------------------------------------------
-  # JOB 2: só roda em push na main (deploy de verdade) - depende do
-  # job de testes ter passado (needs: test).
+  # JOB 2: deploy na AWS - so em push na main e depois dos testes.
   # ---------------------------------------------------------------
   deploy:
     needs: test
@@ -48,21 +56,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: Build with Maven
-        run: mvn -B package --file ${{ env.PROJECT_DIR }}/pom.xml -DskipTests
-
-      # PARTE 4 - Deploy com Docker
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -72,33 +69,49 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # O Dockerfile e multi-stage: compila o jar dentro da imagem.
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: ${{ env.PROJECT_DIR }}
           file: ${{ env.PROJECT_DIR }}/Dockerfile
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/prova-api:${{ github.sha }},${{ secrets.DOCKERHUB_USERNAME }}/prova-api:latest
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
 
-      # PARTE 5 - Executar comandos remotos via SSH na AWS
+      # Maquina AWS: 98.92.113.150 (secret HOST_AWS)
       - name: Deploy na AWS via SSH
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.HOST_AWS }}
           username: ubuntu
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script: |
-            docker stop prova-api || true
+            set -e
+            IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            # Rede e Postgres: cria apenas se ainda nao existirem.
+            docker network inspect rede >/dev/null 2>&1 || docker network create -d bridge rede
+            if ! docker ps -a --format '{{.Names}}' | grep -qx postgres-aula; then
+              docker run -d --name postgres-aula --network rede --restart unless-stopped \
+                -e POSTGRES_DB=provadb -e POSTGRES_USER=usuario \
+                -e POSTGRES_PASSWORD='${{ secrets.DB_PASSWORD }}' \
+                -v pgdata:/var/lib/postgresql/data \
+                postgres:16
+            fi
+            docker start postgres-aula >/dev/null
+
+            docker pull "$IMAGE"
             docker rm --force prova-api || true
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/prova-api:latest
-            docker run -d \
-              --network=rede \
+            docker run -d --name prova-api --network rede --restart unless-stopped \
               -p 8080:8080 \
-              --name prova-api \
               -e DB_HOST=postgres-aula \
               -e DB_PORT=5432 \
               -e DB_NAME=provadb \
               -e DB_USER=usuario \
-              -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
-              ${{ secrets.DOCKERHUB_USERNAME }}/prova-api:latest
+              -e DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
+              "$IMAGE"
+
+            docker image prune -f

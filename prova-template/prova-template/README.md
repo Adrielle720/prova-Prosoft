@@ -1,79 +1,63 @@
-# Template pré-pronto — Prova Projeto de Software
+# API de Produtos — Padrão Observer
 
-Este repo já traz pronto tudo que **não muda** de exercício para exercício.
-Na hora da prova você só mexe no que for específico do enunciado.
+API REST (Spring Boot 3 + JPA + Postgres) para gerenciar produtos de uma loja,
+com **padrão Observer** para auditoria e alerta de estoque.
 
-## O que já vem pronto
+## Rotas
 
-- [x] Spring Boot + Postgres + JPA configurados (`pom.xml`, `application.properties`)
-- [x] Entidade genérica `Item` com soft delete (renomear)
-- [x] Repository com query de `startsWith` + soft delete pronta
-- [x] Service + Controller com as 3 operações-padrão (listar/filtrar, criar, deletar lógico)
-- [x] Tratamento de erros com `@RestControllerAdvice` (404, 400)
-- [x] Testes unitários do service com Mockito (100% de cobertura do template)
-- [x] Teste de integração das 3 rotas com MockMvc + H2 (não depende de Docker rodando)
-- [x] `Dockerfile` multi-stage
-- [x] GitHub Actions (`.github/workflows/deploy.yml`) com:
-  - job de teste (roda em push E pull request)
-  - job de deploy (só em push na main, depende do job de teste passar)
-  - login DockerHub, build+push da imagem, deploy via SSH na AWS
-- [x] `application.properties` já usando variáveis de ambiente com defaults (padrão da Aula de Redes Docker)
+| Método | Rota             | Descrição                    |
+|--------|------------------|------------------------------|
+| POST   | `/produtos`      | Cria produto (201)           |
+| GET    | `/produtos`      | Lista produtos               |
+| GET    | `/produtos/{id}` | Busca por id (404 se não há) |
+| DELETE | `/produtos/{id}` | Exclui produto (204 / 404)   |
 
-## ANTES da prova (fazer em casa, com calma)
+Corpo do POST:
 
-1. **Criar o repositório no GitHub** a partir deste template.
-2. **Criar a conta/imagem no Docker Hub** se ainda não tiver.
-3. **Configurar os Secrets do repositório** (Settings → Secrets and variables → Actions):
-   - `DOCKERHUB_USERNAME`
-   - `DOCKERHUB_TOKEN` (token de acesso do Docker Hub, não a senha)
-   - `HOST_AWS` (IP da máquina AWS que o professor vai dar)
-   - `SSH_KEY` (conteúdo do arquivo `.pem` da AWS)
-   - `DB_PASSWORD` (senha que você quer usar no Postgres)
-4. **Testar o pipeline com um exercício fake**: suba esse template como está,
-   confirme que `test` e `deploy` passam verdes no GitHub Actions e que a
-   aplicação sobe na AWS. **Isso é o que garante que, no dia da prova, você
-   só troca a lógica de negócio e o pipeline já funciona.**
-5. Deixar a rede Docker e o container do Postgres **já criados na sua máquina
-   AWS antes da prova** (se o professor permitir acesso prévio):
-   ```bash
-   docker network create -d bridge rede
-   docker run -d --name postgres-aula \
-     -e POSTGRES_DB=provadb -e POSTGRES_USER=usuario -e POSTGRES_PASSWORD=senha \
-     --network rede -p 5432:5432 postgres
-   ```
-   Se não puder acessar antes, pelo menos **decore/cole esses dois comandos**
-   num bloco de notas para copiar rápido no dia.
-6. Rodar `mvn test` localmente uma vez para confirmar que compila e que o
-   Jacoco gera relatório de cobertura (`target/site/jacoco/index.html`).
+```json
+{ "nome": "Teclado", "descricao": "Mecânico", "preco": 199.90, "quantidade": 5 }
+```
 
-## DURANTE a prova (o que efetivamente muda por exercício)
+## Padrão Observer
 
-1. Renomear `Item` → entidade do enunciado (ex: `Curso`), ajustar os atributos.
-2. Ajustar `ItemRequest` com os campos pedidos.
-3. Ajustar `ItemRepository` se precisar de outras queries.
-4. Ajustar regras específicas em `ItemService` (a estrutura de listar/criar/deletar já está pronta).
-5. Trocar `/itens` pela rota pedida no `ItemController`.
-6. Copiar/ajustar os testes (unitário + integração) para os novos nomes —
-   a estrutura de "mockar o repository" e "MockMvc nas 3 rotas" já está pronta,
-   é só adaptar assinatura e valores.
-7. `git add . && git commit -m "..." && git push` — pipeline dispara sozinho.
-8. Se o enunciado pedir "uma rota via Pull Request": criar uma branch, implementar
-   só aquela rota lá, abrir PR contra `main` — o job `test` do Actions dispara
-   automaticamente por causa do trigger `pull_request` já configurado.
+- **Subject:** `ProdutoService` — após `criar` (CREATE) e `excluir` (DELETE)
+  publica um `ProdutoEvento` para todos os `ProdutoObserver` (injetados pelo Spring).
+- **Observer 1 — `AuditoriaObserver`:** grava na tabela `auditoria` a operação,
+  o timestamp e o id do produto.
+- **Observer 2 — `EstoqueBaixoObserver`:** em um CREATE com `quantidade < 10`,
+  escreve `ALERTA: estoque baixo ...` no log (nível WARN).
 
-## Comandos que você pode precisar colar rápido
+Para adicionar um novo observer basta criar um `@Component` que implemente `ProdutoObserver`.
+
+## Testes
 
 ```bash
-# rodar local sem docker
-mvn spring-boot:run
-
-# rodar todos os testes + ver cobertura
-mvn test
-
-# build da imagem manual (se quiser testar antes do Actions fazer sozinho)
-docker build -t SEU_USUARIO/prova-api .
-docker push SEU_USUARIO/prova-api
-
-# ssh na AWS
-ssh ubuntu@SEU_IP -i chave.pem
+mvn verify
 ```
+
+- `ProdutoServiceTest` — testes de unidade (Mockito) com **100% de cobertura** do
+  `ProdutoService`. O `jacoco:check` no `pom.xml` falha o build se cair abaixo disso.
+- `ProdutoIntegrationTest` — teste de integração da rota `POST /produtos`
+  (MockMvc + H2), verificando a resposta, a persistência e o registro de auditoria.
+- Relatório de cobertura: `target/site/jacoco/index.html`.
+
+## CI/CD
+
+Workflow em `.github/workflows/deploy.yml` (raiz do repositório):
+
+1. **test** — em push e pull request para `main`: `mvn verify`.
+2. **deploy** — só em push na `main`, após os testes: build e push da imagem
+   no Docker Hub, depois SSH na AWS (`98.92.113.150`) para subir o container
+   `prova-api` na rede `rede`, ligado ao `postgres-aula` (criados se não existirem).
+
+Secrets necessários (Settings → Secrets and variables → Actions):
+
+| Secret               | Valor                                              |
+|----------------------|----------------------------------------------------|
+| `DOCKERHUB_USERNAME` | usuário do Docker Hub                              |
+| `DOCKERHUB_TOKEN`    | access token do Docker Hub                         |
+| `HOST_AWS`           | `98.92.113.150`                                    |
+| `SSH_KEY`            | conteúdo do arquivo `.pem`                         |
+| `DB_PASSWORD`        | senha do Postgres `postgres-aula` na máquina AWS   |
+
+A porta **8080** precisa estar liberada no Security Group da instância.
